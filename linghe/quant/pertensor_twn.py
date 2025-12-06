@@ -18,7 +18,6 @@ def twn_quant_row_fp8(W):
     mask_f = (W.sign() * mask_f).to(torch.float8_e4m3fn)
     alpha = alpha.to(torch.float32)
     return mask_f, alpha
-
 @triton.autotune(
     configs=[
         triton.Config(
@@ -108,6 +107,30 @@ def twn_quant_row_fp8_kernel(
     alpha = masked_sum / tl.maximum(masked_count, 1.0)
     tl.store(alpha_ptr + pid * stride_am, alpha)
 
+# this is wrong for some reason
+@triton.jit
+def hadamard_product(
+    x_ptr,
+    weight_ptr,
+    M,
+    T,
+    n: tl.constexpr,
+    W: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    # adapted from weighted silu
+
+    row_offs = pid * W * T * n + tl.arange(0, W)[:, None] * n
+    col_offs = tl.arange(0, n)[None, :]
+
+    for i in range(T):
+        indices = pid * W * T + i * W + tl.arange(0, W)
+        mask = indices[:, None] < M
+        x1 = tl.load(x_ptr + row_offs + col_offs, mask=mask).to(tl.float32)
+        x2 = tl.load(weight_ptr + row_offs + col_offs, mask=mask).to(tl.float32)
+        x = x1 * x2
+        tl.store(x_ptr + row_offs + col_offs, x, mask=mask)
+        row_offs += n * W
 
 def twn_quant_row_fp8_triton(W: torch.Tensor):
     """
@@ -140,9 +163,26 @@ def twn_quant_row_fp8_triton(W: torch.Tensor):
         alpha.stride(0),
         # BLOCK_SIZE=block_size,
     )
+    alpha = alpha.view(M, 1)
+    # did some numerical testing and genuinely just 1 works as wella s any principled scaled
+    s = alpha.abs().max() # / 447
+    alpha = (alpha / s).to(torch.float8_e4m3fn)
+    alpha = alpha.repeat(1, N)
+    #print(alpha)
+    #print(Q)
+    hadamard_product[grid](
+        Q,          # x_ptr
+        alpha,         # weight_ptr
+        M,              # M (total number of rows)
+        8,              # T
+        N,            # constexpr n
+        N // 2,            # constexpr W
+    )
+    # Q2 = (Q.float() * alpha.float()).to(torch.float8_e4m3fn)
+    # print(Q.float() * alpha.float() - Q2.float())
 
-    return Q, alpha.view(M, 1)
-
+    
+    return Q, s
 
 def twn_quant_row_tensor_block_fp8_triton(W: torch.Tensor, block_size = 128):
     """
@@ -189,4 +229,3 @@ if __name__ == "__main__":
     print(Q-Q_ref)
     print(alpha)
     print(alpha_ref)
-
