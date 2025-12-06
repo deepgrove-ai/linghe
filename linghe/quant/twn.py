@@ -143,6 +143,60 @@ def twn_quant_row_fp8_triton(W: torch.Tensor):
 
     return Q, alpha.view(M, 1)
 
+@triton.jit
+def block_mean_128_fused_kernel(
+    x_ptr,           # *const float (length M)
+    out_ptr,         # *mut float, flattened (M_blk * N_blk)
+    M,               # total length of x (number of rows)
+    N_blk,           # = N // 128 (number of column blocks)
+    BLOCK_M: tl.constexpr,   # 128 (rows per block)
+    BLOCK_NB: tl.constexpr,  # max N_blk per program (e.g. 128)
+):
+    # Each program handles one row-block of 128 elements
+    row_block_id = tl.program_id(axis=0)  # 0 .. M_blk-1, where M_blk = M // 128
+
+    # ---- compute mean over 128 rows for this block ----
+    row_offs = row_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_rows = row_offs < M
+
+    x = tl.load(x_ptr + row_offs, mask=mask_rows, other=0.0).to(tl.float32)
+    block_sum = tl.sum(x, axis=0)
+    valid_count = tl.sum(mask_rows, axis=0).to(tl.float32)
+    mean = block_sum / valid_count  # scalar
+
+    # ---- broadcast this mean across N_blk columns ----
+    cols = tl.arange(0, BLOCK_NB)
+    mask_cols = cols < N_blk
+
+    # out is logically [M_blk, N_blk], row-major
+    out_row_base = row_block_id * N_blk
+    out_offs = out_row_base + cols
+
+    tl.store(out_ptr + out_offs, mean, mask=mask_cols)
+
+@triton.jit
+def block_mean_128_kernel(
+    x_ptr,          # *const float / bf16 / whatever
+    out_ptr,        # *mut float (one mean per block)
+    K,              # total length of x
+    BLOCK_SIZE: tl.constexpr,  # should be 128 for your case
+):
+    pid = tl.program_id(axis=0)  # block index
+    # Offsets for this block
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < K
+
+    # Load block
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Sum and count valid elements (for tail block)
+    block_sum = tl.sum(x, axis=0)
+    valid_count = tl.sum(mask, axis=0).to(tl.float32)
+
+    mean = block_sum / valid_count
+
+    # One output per block
+    tl.store(out_ptr + pid, mean)
 
 def twn_quant_row_tensor_block_fp8_triton(W: torch.Tensor, block_size = 128):
     """
@@ -159,6 +213,7 @@ def twn_quant_row_tensor_block_fp8_triton(W: torch.Tensor, block_size = 128):
 
     Q = torch.empty_like(W, dtype=torch.float8_e4m3fn)
     alpha = torch.empty((M,), device=W.device, dtype=torch.float32)
+    real_alpha = torch.empty((M // 128, 1), device=W.device, dtype=torch.float32)
 
 
     grid = (M,)
@@ -176,7 +231,18 @@ def twn_quant_row_tensor_block_fp8_triton(W: torch.Tensor, block_size = 128):
         # BLOCK_SIZE=block_size,
     )
     # idea here is to approx tensor scaling factor as mean (per tensor ternary) and then expand to block size of deepseek fp8
-    return Q, torch.mean(alpha).expand(M // 128, N // 128)
+    
+    # block_mean_128_fused_kernel[grid](
+    #     alpha,
+    #     real_alpha,
+    #     M,
+    #     N // 128,
+    #     BLOCK_M=128,
+    #     BLOCK_NB=M//128,
+
+    # )
+    # print(real_alpha)
+    return Q, real_alpha.repeat(1, N // 128)
 
 
 if __name__ == "__main__":
