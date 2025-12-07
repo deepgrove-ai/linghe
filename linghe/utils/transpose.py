@@ -10,7 +10,8 @@ import triton
 import triton.language as tl
 from triton import Config
 
-from linghe.tools.util import round_up
+def round_up(x, b=16):
+    return ((x - 1) // b + 1) * b
 
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
