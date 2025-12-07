@@ -232,16 +232,13 @@ def twn_quant_row_tensor_block_fp8_triton(W: torch.Tensor, block_size = 128):
     )
     # idea here is to approx tensor scaling factor as mean (per tensor ternary) and then expand to block size of deepseek fp8
     
-    # block_mean_128_fused_kernel[grid](
-    #     alpha,
-    #     real_alpha,
-    #     M,
-    #     N // 128,
-    #     BLOCK_M=128,
-    #     BLOCK_NB=M//128,
-
-    # )
-    # print(real_alpha)
+    block_mean_128_kernel[grid](
+        alpha,
+        real_alpha,
+        M,
+        128,
+    )
+    
     return Q, real_alpha.repeat(1, N // 128)
 
 
